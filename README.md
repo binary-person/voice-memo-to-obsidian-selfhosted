@@ -186,6 +186,8 @@ time: "14:30"
 status:
 ---
 
+In addition, the transcript file `.vtt` is stored at `Daily/Babble/{Note name}.vtt`. To easily view this in Obsidian, use enable community plugin "Custom File Extensions" and add `vtt` to the list.
+
 ## Tasks
 
 - [ ] Send follow-up email #today
