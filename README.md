@@ -1,16 +1,16 @@
-# Voice Memo to Obsidian
+# Voice Memo to Obsidian (self-hosted)
+
+(differences from mobob's version: self-hosted speaches.ai instead of Gemini for transcription, and self-hosted Ollama gemma3:12b instead of Gemini for summarization)
 
 Automatically transcribe iOS Voice Memos and create Obsidian notes with AI-generated summaries, tags, and extracted tasks.
 
-Lots of room to update and personalize this, but wanted to crystalize the first version i got up and running in case its useful for anyone.
-
-This version uses cron because I generally find it more reliable than Automator, and Gemini because its cheap and reasonably reliable.
+Lots of room to update and personalize this, but wanted to crystalize the first version i got up and running in case its useful for anyone (yes, to me. Thank you mobob; - Simon).
 
 ## Features
 
 - **Automatic processing** - Polls for new voice memos every 2 minutes via cron
-- **AI transcription** - Uses Google Gemini API for accurate speech-to-text
-- **Smart analysis** - Extracts title, summary, tags, and tasks from content
+- **AI transcription** - Uses self-hosted speaches.ai "faster-whisper-large-v3" for accurate speech-to-text
+- **Smart analysis** - Extracts title, summary, tags, and tasks from content using self-hosted ollama "gemma3:12b"
 - **Task extraction** - Pulls out action items with priority levels (#asap, #today, #thisweek, etc.)
 - **Obsidian integration** - Creates properly formatted notes with YAML frontmatter
 - **Customizable prompts** - Edit AI prompts directly in your Obsidian vault
@@ -25,7 +25,7 @@ This version uses cron because I generally find it more reliable than Automator,
                                                │
                                                ▼
                                         ┌─────────────┐
-                                        │ Gemini API  │
+                                        │ Ollama API  │
                                         │ Transcribe  │
                                         │ + Analyze   │
                                         └─────────────┘
@@ -34,16 +34,17 @@ This version uses cron because I generally find it more reliable than Automator,
 1. Record a voice memo on your iPhone
 2. iCloud syncs it to `~/Library/Group Containers/group.com.apple.VoiceMemos.shared/Recordings/`
 3. Cron job detects new files every 2 minutes
-4. Script converts audio to MP3 and uploads to Gemini
-5. Gemini transcribes and analyzes the content
+4. Script converts audio to MP3 and uploads to speaches.ai
+5. Ollama transcribes and analyzes the content
 6. A new note is created in your Obsidian vault
 
 ## Requirements
 
-- macOS (tested on Sonoma/Sequoia)
+- macOS (tested on Sequoia)
 - [Homebrew](https://brew.sh)
 - Obsidian vault
-- Google Gemini API key (free tier works fine)
+- 1st GPU with at least 6.5GB ram (for speaches.ai Systran/faster-whisper-large-v3 model)
+- 2nd GPU with at least 9GB ram (for ollama gemma3:12b model) (or have 1 GPU with at least 6.5+9=15.5GB of ram)
 - iOS Voice Memos app with iCloud sync enabled
 
 ## Installation
@@ -54,21 +55,75 @@ This version uses cron because I generally find it more reliable than Automator,
 brew install ffmpeg jq
 ```
 
-### 2. Get a Gemini API key
+### 2.1 Configure speaches-ai
 
-Visit [Google AI Studio](https://makersuite.google.com/app/apikey) and create an API key.
+Make sure your Nvidia CUDA runtime is at least 12.4
+
+As of speaches-ai/speaches v0.9.0-rc.3, long audio recordings (for me it was >=5 mins) cause stt model to endlessly loop. See (#619)[https://github.com/speaches-ai/speaches/issues/619]
+
+I fixed it by patching the stt.py file inside.
+
+First, create the compose.yml file:
+
+```yaml
+services:
+  speaches-ai:
+    ports:
+      - 8000:8000
+    volumes:
+      - ./hf-hub-cache:/home/ubuntu/.cache/huggingface/hub
+      - ./patches/stt.py:/home/ubuntu/speaches/src/speaches/routers/stt.py
+    environment:
+      - LOOPBACK_HOST_URL=http://127.0.0.1:8000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu
+    image: ghcr.io/speaches-ai/speaches:latest-cuda # uses CUDA >=12.6. Use 'latest-cuda-12.4.1' if running CUDA >=12.4
+```
+
+Then run the following to patch:
+
+```bash
+cid=$(docker create ghcr.io/speaches-ai/speaches:latest-cuda) && mkdir -p patches && docker cp "$cid":/home/ubuntu/speaches/src/speaches/routers/stt.py ./patches/ && docker rm "$cid"
+
+grep -q 'condition_on_previous_text' patches/stt.py || sed -i '/vad_filter=effective_vad_filter,/a\
+            condition_on_previous_text=False,' patches/stt.py
+```
+
+This docker compose can be on any machine. Just make sure to note down the speaches-ai server for the SPEACHES_ENDPOINT later. (ex. "http://192.168.1.123:8000")
+
+Download the model on the speaches-ai server:
+
+```
+curl "$SPEACHES_ENDPOINT/v1/models/Systran/faster-whisper-large-v3" -X POST
+```
+
+In the few tests I did, the model `Systran/faster-whisper-large-v3` works well with multiple languages. If you specify a language (later set as `SPEACHES_LANGUAGE`), it can convert other langauges to chosen language in the transcription.
+
+### 2.2 Configure ollama
+
+Download gemma3:12b or any equivalent model that excels at multilingual and structured/formatted responses. Then make sure it's accessible to the macbook this script runs on. Note the following values for later. Example values:
+
+- OLLAMA_ENDPOINT="http://192.168.1.124:11434"
+- OLLAMA_MODEL="gemma3:12b"
 
 ### 3. Run the installer
 
 ```bash
-git clone https://github.com/yourusername/voice-memo-to-obsidian.git
-cd voice-memo-to-obsidian
+git clone https://github.com/binary-person/voice-memo-to-obsidian-selfhosted.git
+cd voice-memo-to-obsidian-selfhosted
 ./install.sh
 ```
 
 The installer will prompt for:
 - Your Obsidian vault path
-- Your Gemini API key
+- Your speaches.ai instance endpoint
+- Your ollama instance endpoint and ollama model
 
 ### 4. Grant Full Disk Access to cron
 
@@ -84,7 +139,7 @@ This is required for cron to read the Voice Memos directory.
 When a new version is released:
 
 ```bash
-cd voice-memo-to-obsidian
+cd voice-memo-to-obsidian-selfhosted
 git pull
 ./upgrade.sh
 ```
@@ -150,11 +205,12 @@ Hey, so I just got out of the meeting and wanted to capture a few thoughts...
 ### Config file (`~/.config/voice-memo/config`)
 
 ```bash
-GEMINI_API_KEY="your-api-key"
+SPEACHES_ENDPOINT="http://192.168.1.123:8000"
+SPEACHES_MODEL="Systran/faster-whisper-large-v3"
+SPEACHES_LANGUAGE="en"
 OBSIDIAN_VAULT="/path/to/your/vault"
-
-# Optional: change the model (default: gemini-2.5-flash)
-GEMINI_MODEL="gemini-2.5-flash"
+OLLAMA_ENDPOINT="http://192.168.1.124:11434"
+OLLAMA_MODEL="gemma3:12b"
 ```
 
 ### Polling interval
@@ -226,10 +282,6 @@ The cron daemon needs Full Disk Access. See installation step 4.
 - Verify Full Disk Access is granted to `/usr/sbin/cron`
 - Check that Voice Memos are syncing to your Mac (open Voice Memos app on Mac)
 
-### Rate limit errors (429)
-
-Gemini free tier has limits. Wait a minute and try again, or use a paid API key.
-
 ### Files not being detected
 
 The watcher only looks for files modified in the last 10 minutes. For older files, process them manually:
@@ -250,9 +302,19 @@ This removes the cron job and config directory. Notes and prompts in your Obsidi
 
 ## Privacy
 
-- Audio is uploaded to Google's Gemini API for processing
-- Files are deleted from Gemini after processing
-- No data is stored outside your local machine and Obsidian vault
+100% private. You can run this in the middle of a dessert without WiFi and it should still transcribe and analyze.
+
+With that in mind, some important reminders for privacy and protection:
+
+- If iCloud Advanced Data Protection is not on, your iCloud backups of your voice memos are not protected and can be read by Apple.
+- If your speaches-ai or ollama instance is outside of your LAN, run them through tailscale. If you want to put them on a publicly accessible IP, expose it locally, and route both through a reverse proxy like Nginx Proxy Manager. If you go with that route, make sure timeouts are disabled in the nginx config so your transcription/analysis don't get cut short:
+
+```yaml
+# 3 day timeout
+proxy_read_timeout 259200s;
+proxy_connect_timeout 259200s;
+proxy_send_timeout 259200s;
+```
 
 ## Credits
 

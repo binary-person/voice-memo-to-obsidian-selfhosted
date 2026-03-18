@@ -3,12 +3,25 @@
 # Copy this to ~/.config/voice-memo/config and fill in your values
 #
 
-# Required: Your Gemini API key
-# Get one at: https://makersuite.google.com/app/apikey
-GEMINI_API_KEY=""
+# Required: your local speaches.ai endpoint. See README.md for instructions
+SPEACHES_ENDPOINT=""
+
+# Required: speaches.ai transcription model
+# Default: "Systran/faster-whisper-large-v3"
+SPEACHES_MODEL="Systran/faster-whisper-large-v3"
 
 # Required: Path to your Obsidian vault
 OBSIDIAN_VAULT=""
 
-# Optional: Gemini model to use (default: gemini-2.5-flash)
-# GEMINI_MODEL="gemini-2.5-flash"
+# Required: your local Ollama endpoint. Make sure it can run the model specified
+OLLAMA_ENDPOINT=""
+
+# Optional: default is "gemma3:12b"
+OLLAMA_MODEL="gemma3:12b"
+
+# Optional: language code for your speaches.ai transcription model
+# Default: "en"
+# Note: for Systran/faster-whisper-large-v3, language codes follow Whisper's mapping:
+# https://github.com/openai/whisper/blob/main/whisper/tokenizer.py
+# Confirm your model's expected language value before setting this
+SPEACHES_LANGUAGE="en"

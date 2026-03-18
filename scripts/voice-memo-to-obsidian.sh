@@ -1,7 +1,7 @@
 #!/bin/zsh
 #
 # voice-memo-to-obsidian.sh
-# Transcribes voice memos using Gemini API and creates Obsidian notes
+# Transcribes voice memos using speaches.ai and creates Obsidian notes
 #
 
 set -e
@@ -21,8 +21,18 @@ fi
 source "$CONFIG_FILE"
 
 # Validate required config
-if [[ -z "$GEMINI_API_KEY" ]]; then
-    echo "ERROR: GEMINI_API_KEY not set in config"
+if [[ -z "$SPEACHES_ENDPOINT" ]]; then
+    echo "ERROR: SPEACHES_ENDPOINT not set in config"
+    exit 1
+fi
+
+if [[ -z "$SPEACHES_MODEL" ]]; then
+    echo "ERROR: SPEACHES_MODEL not set in config"
+    exit 1
+fi
+
+if [[ -z "$OLLAMA_ENDPOINT" ]]; then
+    echo "ERROR: OLLAMA_ENDPOINT not set in config"
     exit 1
 fi
 
@@ -35,9 +45,9 @@ fi
 VOICE_MEMOS_PATH="$OBSIDIAN_VAULT/Daily/Babble"
 PROMPTS_DIR="$OBSIDIAN_VAULT/Areas/Voice Memo Pipeline"
 
-# Gemini API settings
-GEMINI_MODEL="${GEMINI_MODEL:-gemini-2.5-flash}"
-GEMINI_API_BASE="https://generativelanguage.googleapis.com"
+# AI settings
+SPEACHES_MODEL="${SPEACHES_MODEL:-Systran/faster-whisper-large-v3}"
+OLLAMA_MODEL="${OLLAMA_MODEL:-gemma3:12b}"
 
 # Find ffmpeg
 if [[ -x "/opt/homebrew/bin/ffmpeg" ]]; then
@@ -53,6 +63,20 @@ if [[ -z "$FFMPEG" ]]; then
     exit 1
 fi
 
+# Find jq
+if [[ -x "/opt/homebrew/bin/jq" ]]; then
+    JQ="/opt/homebrew/bin/jq"
+elif [[ -x "/usr/local/bin/jq" ]]; then
+    JQ="/usr/local/bin/jq"
+else
+    JQ=$(which jq 2>/dev/null || echo "")
+fi
+
+if [[ -z "$JQ" ]]; then
+    echo "ERROR: jq not found. Install with: brew install jq"
+    exit 1
+fi
+
 # Create directories
 mkdir -p "$PROCESSED_DIR" "$VOICE_MEMOS_PATH" "$(dirname "$LOG_FILE")"
 
@@ -64,7 +88,7 @@ log() {
 # Check for required argument
 if [[ -z "$1" ]]; then
     log "ERROR: No input file provided"
-    echo "Usage: $0 <path-to-m4a-file>"
+    echo "Usage: $0 <path-to-audio-file>"
     exit 1
 fi
 
@@ -86,10 +110,10 @@ fi
 
 log "Processing: $FILENAME"
 
-# Convert to MP3 for API compatibility
+# Preprocess audio for transcription
 TEMP_DIR=$(mktemp -d)
-MP3_FILE="$TEMP_DIR/audio.mp3"
-TEMP_INPUT="$TEMP_DIR/input.m4a"
+PREPROCESSED_FILE="$TEMP_DIR/audio.m4a"
+TEMP_INPUT="$TEMP_DIR/input.${FILENAME##*.}"
 
 # Copy input file to temp (avoids FDA issues with ffmpeg)
 log "Copying to temp..."
@@ -99,98 +123,79 @@ if ! cp "$INPUT_FILE" "$TEMP_INPUT" 2>&1; then
     exit 1
 fi
 
-log "Converting to MP3..."
+log "Preprocessing audio..."
 FFMPEG_LOG="$TEMP_DIR/ffmpeg.log"
-if ! "$FFMPEG" -i "$TEMP_INPUT" -codec:a libmp3lame -qscale:a 2 -y "$MP3_FILE" 2>"$FFMPEG_LOG"; then
+if ! "$FFMPEG" -i "$TEMP_INPUT" -af "highpass=f=80,speechnorm=e=12:r=0.0005:l=1" -y "$PREPROCESSED_FILE" 2>"$FFMPEG_LOG"; then
     log "ERROR: ffmpeg failed"
     log "ERROR: $(cat "$FFMPEG_LOG" | tail -5)"
     rm -rf "$TEMP_DIR"
     exit 1
 fi
 
-if [[ ! -f "$MP3_FILE" ]]; then
-    log "ERROR: MP3 file not created"
+if [[ ! -f "$PREPROCESSED_FILE" ]]; then
+    log "ERROR: Preprocessed audio file not created"
     rm -rf "$TEMP_DIR"
     exit 1
 fi
 
 # Get file size for upload
-FILE_SIZE=$(stat -f%z "$MP3_FILE")
+FILE_SIZE=$(stat -f%z "$PREPROCESSED_FILE")
 log "Audio file size: $FILE_SIZE bytes"
 
-# Step 1: Initialize resumable upload
-log "Initializing Gemini upload..."
-INIT_RESPONSE=$(curl -s -X POST \
-    "${GEMINI_API_BASE}/upload/v1beta/files?key=${GEMINI_API_KEY}" \
-    -H "X-Goog-Upload-Protocol: resumable" \
-    -H "X-Goog-Upload-Command: start" \
-    -H "X-Goog-Upload-Header-Content-Length: ${FILE_SIZE}" \
-    -H "X-Goog-Upload-Header-Content-Type: audio/mp3" \
-    -H "Content-Type: application/json" \
-    -d '{"file": {"display_name": "voice_memo"}}' \
-    -D - 2>/dev/null)
-
-UPLOAD_URL=$(echo "$INIT_RESPONSE" | grep -i "x-goog-upload-url:" | cut -d' ' -f2 | tr -d '\r')
-
-if [[ -z "$UPLOAD_URL" ]]; then
-    log "ERROR: Failed to get upload URL"
-    log "Response: $INIT_RESPONSE"
-    rm -rf "$TEMP_DIR"
-    exit 1
-fi
-
-# Step 2: Upload the file
-log "Uploading audio to Gemini..."
-UPLOAD_RESPONSE=$(curl -s -X POST "$UPLOAD_URL" \
-    -H "X-Goog-Upload-Command: upload, finalize" \
-    -H "X-Goog-Upload-Offset: 0" \
-    -H "Content-Type: audio/mp3" \
-    --data-binary @"$MP3_FILE" 2>/dev/null)
-
-FILE_URI=$(echo "$UPLOAD_RESPONSE" | /usr/bin/jq -r '.file.uri // empty')
-
-if [[ -z "$FILE_URI" ]]; then
-    log "ERROR: Failed to upload file"
-    log "Response: $UPLOAD_RESPONSE"
-    rm -rf "$TEMP_DIR"
-    exit 1
-fi
-
-log "File uploaded: $FILE_URI"
-
-# Step 3: Transcribe
+# Step 1: Transcribe with speaches.ai
 log "Requesting transcription..."
-TRANSCRIPTION_FILE="$TEMP_DIR/transcription.json"
+TRANSCRIPTION_FILE="$TEMP_DIR/transcription.vtt"
 
 # Read transcription prompt
 if [[ -f "$PROMPTS_DIR/transcription-prompt.md" ]]; then
     TRANSCRIPTION_PROMPT=$(cat "$PROMPTS_DIR/transcription-prompt.md")
 else
-    TRANSCRIPTION_PROMPT="Transcribe this audio recording exactly as spoken. Include all words, pauses indicated by '...' and any verbal fillers. Do not summarize or paraphrase. Output only the transcription, no other text."
+    TRANSCRIPTION_PROMPT="Transcribe clearly and preserve punctuation."
 fi
 
-# Build transcription request using jq for safe JSON encoding
-TRANSCRIPTION_PAYLOAD=$(/usr/bin/jq -n \
-    --arg prompt "$TRANSCRIPTION_PROMPT" \
-    --arg file_uri "$FILE_URI" \
-    '{
-        contents: [{
-            parts: [
-                {file_data: {mime_type: "audio/mp3", file_uri: $file_uri}},
-                {text: $prompt}
-            ]
-        }]
-    }')
+# Build transcription request
+TRANSCRIPTION_CURL_ARGS=(
+    -s
+    "${SPEACHES_ENDPOINT}/v1/audio/transcriptions"
+    -F "file=@${PREPROCESSED_FILE}"
+    -F "prompt=${TRANSCRIPTION_PROMPT}"
+    -F "model=${SPEACHES_MODEL}"
+    -F "response_format=vtt"
+    -F "temperature=0"
+    -F "stream=false"
+)
 
-curl -s -X POST \
-    "${GEMINI_API_BASE}/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}" \
-    -H "Content-Type: application/json" \
-    -d "$TRANSCRIPTION_PAYLOAD" -o "$TRANSCRIPTION_FILE" 2>/dev/null
+if [[ -n "$SPEACHES_LANGUAGE" ]]; then
+    TRANSCRIPTION_CURL_ARGS+=(-F "language=${SPEACHES_LANGUAGE}")
+fi
 
-TRANSCRIPT=$(/usr/bin/jq -r '.candidates[0].content.parts[0].text // empty' "$TRANSCRIPTION_FILE" 2>/dev/null)
+if ! curl "${TRANSCRIPTION_CURL_ARGS[@]}" -o "$TRANSCRIPTION_FILE" 2>/dev/null; then
+    log "ERROR: Failed to get transcription"
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+if [[ ! -s "$TRANSCRIPTION_FILE" ]]; then
+    log "ERROR: Transcription file is empty"
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+# Convert VTT to plain text for downstream analysis
+TRANSCRIPT=$(awk '
+BEGIN { in_cue=0 }
+{
+    gsub(/\r/, "", $0)
+    if ($0 ~ /^WEBVTT/) next
+    if ($0 ~ /^[[:space:]]*$/) next
+    if ($0 ~ /^[0-9]+$/) next
+    if ($0 ~ /-->/) next
+    if ($0 ~ /^(NOTE|STYLE|REGION)/) next
+    print
+}' "$TRANSCRIPTION_FILE" | awk '!seen[$0]++')
 
 if [[ -z "$TRANSCRIPT" ]]; then
-    log "ERROR: Failed to get transcription"
+    log "ERROR: Failed to extract transcript text from VTT"
     log "Response: $(cat "$TRANSCRIPTION_FILE")"
     rm -rf "$TEMP_DIR"
     exit 1
@@ -198,7 +203,7 @@ fi
 
 log "Transcription received (${#TRANSCRIPT} chars)"
 
-# Step 4: Analyze for title, summary, tags
+# Step 2: Analyze for title, summary, tags
 log "Analyzing content..."
 
 # Read analysis prompt from Obsidian (or use default)
@@ -223,24 +228,23 @@ ANALYSIS_PROMPT="${ANALYSIS_PROMPT_BASE}
 ${TRANSCRIPT}"
 
 # Use jq to safely construct the JSON payload
-ANALYSIS_PAYLOAD=$(/usr/bin/jq -n --arg prompt "$ANALYSIS_PROMPT" '{
-    contents: [{
-        parts: [{
-            text: $prompt
-        }]
-    }],
-    generationConfig: {
-        responseMimeType: "application/json"
-    }
-}')
+ANALYSIS_PAYLOAD=$("$JQ" -n \
+    --arg model "$OLLAMA_MODEL" \
+    --arg prompt "$ANALYSIS_PROMPT" \
+    '{
+        model: $model,
+        prompt: $prompt,
+        format: "json",
+        stream: false
+    }')
 
 ANALYSIS_FILE="$TEMP_DIR/analysis.json"
 curl -s -X POST \
-    "${GEMINI_API_BASE}/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}" \
+    "${OLLAMA_ENDPOINT}/api/generate" \
     -H "Content-Type: application/json" \
     -d "$ANALYSIS_PAYLOAD" -o "$ANALYSIS_FILE" 2>/dev/null
 
-ANALYSIS_JSON=$(/usr/bin/jq -r '.candidates[0].content.parts[0].text // empty' "$ANALYSIS_FILE" 2>/dev/null)
+ANALYSIS_JSON=$("$JQ" -r '.response // empty' "$ANALYSIS_FILE" 2>/dev/null)
 
 if [[ -z "$ANALYSIS_JSON" ]]; then
     log "WARNING: Failed to get analysis, using defaults"
@@ -250,10 +254,10 @@ if [[ -z "$ANALYSIS_JSON" ]]; then
     TAGS='["voicememos"]'
     TODOS='[]'
 else
-    TITLE=$(echo "$ANALYSIS_JSON" | /usr/bin/jq -r '.title // "Voice Memo"')
-    SUMMARY=$(echo "$ANALYSIS_JSON" | /usr/bin/jq -r '.summary // "Voice memo"')
-    TAGS=$(echo "$ANALYSIS_JSON" | /usr/bin/jq -r '.tags // ["voicememos"]')
-    TODOS=$(echo "$ANALYSIS_JSON" | /usr/bin/jq -r '.todos // []')
+    TITLE=$(echo "$ANALYSIS_JSON" | "$JQ" -r '.title // "Voice Memo"' 2>/dev/null || echo "Voice Memo")
+    SUMMARY=$(echo "$ANALYSIS_JSON" | "$JQ" -r '.summary // "Voice memo"' 2>/dev/null || echo "Voice memo")
+    TAGS=$(echo "$ANALYSIS_JSON" | "$JQ" -c '.tags // ["voicememos"]' 2>/dev/null || echo '["voicememos"]')
+    TODOS=$(echo "$ANALYSIS_JSON" | "$JQ" -c '.todos // []' 2>/dev/null || echo '[]')
 fi
 
 log "Analysis complete: $TITLE"
@@ -263,7 +267,7 @@ TODAY=$(date '+%Y-%m-%d')
 TIME=$(date '+%H:%M')
 
 # Format tags for YAML frontmatter (as array)
-TAGS_YAML=$(echo "$TAGS" | /usr/bin/jq -r '.[] | "  - " + .')
+TAGS_YAML=$(echo "$TAGS" | "$JQ" -r '.[] | "  - " + .' 2>/dev/null)
 # Always include voicememos tag
 if ! echo "$TAGS_YAML" | grep -q "voicememos"; then
     TAGS_YAML="  - voicememos
@@ -272,27 +276,103 @@ fi
 
 # Format todos - AI returns pre-formatted strings, just join with newlines
 TODOS_MD=""
-TODO_COUNT=$(echo "$TODOS" | /usr/bin/jq 'length')
+TODO_COUNT=$(echo "$TODOS" | "$JQ" 'length' 2>/dev/null || echo "0")
 if [[ "$TODO_COUNT" -gt 0 ]]; then
     TODOS_MD="## Tasks
 
 "
-    TODOS_MD+=$(echo "$TODOS" | /usr/bin/jq -r '.[]')
+    TODOS_MD+=$(echo "$TODOS" | "$JQ" -r '.[]' 2>/dev/null)
     TODOS_MD+="
 
 "
 fi
 
-# Create safe filename from title
-SAFE_TITLE=$(echo "$TITLE" | sed 's/[^a-zA-Z0-9 ]//g' | sed 's/  */ /g')
-NOTE_FILENAME="${SAFE_TITLE}.md"
+# Get date/time for filename
+TIMESTAMP_DATE=""
+TIMESTAMP_TIME=""
+
+# First choice: parse from filename (format: YYYYMMDD HHMMSS-...)
+if [[ "$FILENAME" =~ '^([0-9]{8}) ([0-9]{6})-' ]]; then
+    RAW_DATE="${match[1]}"
+    RAW_TIME="${match[2]}"
+    TIMESTAMP_DATE="${RAW_DATE:0:4}-${RAW_DATE:4:2}-${RAW_DATE:6:2}"
+    TIMESTAMP_TIME="${RAW_TIME:0:2}:${RAW_TIME:2:2}:${RAW_TIME:4:2}"
+else
+    # Second choice: use newer of added/modified date
+    FILE_MTIME_EPOCH=$(stat -f "%m" "$INPUT_FILE" 2>/dev/null || echo "")
+    FILE_BTIME_EPOCH=$(stat -f "%B" "$INPUT_FILE" 2>/dev/null || echo "")
+
+    if [[ -n "$FILE_MTIME_EPOCH" && -n "$FILE_BTIME_EPOCH" ]]; then
+        if [[ "$FILE_MTIME_EPOCH" -ge "$FILE_BTIME_EPOCH" ]]; then
+            FILE_TIME_EPOCH="$FILE_MTIME_EPOCH"
+        else
+            FILE_TIME_EPOCH="$FILE_BTIME_EPOCH"
+        fi
+    elif [[ -n "$FILE_MTIME_EPOCH" ]]; then
+        FILE_TIME_EPOCH="$FILE_MTIME_EPOCH"
+    elif [[ -n "$FILE_BTIME_EPOCH" ]]; then
+        FILE_TIME_EPOCH="$FILE_BTIME_EPOCH"
+    else
+        FILE_TIME_EPOCH=""
+    fi
+
+    if [[ -n "$FILE_TIME_EPOCH" ]]; then
+        TIMESTAMP_DATE=$(date -r "$FILE_TIME_EPOCH" '+%Y-%m-%d')
+        TIMESTAMP_TIME=$(date -r "$FILE_TIME_EPOCH" '+%H:%M:%S')
+    else
+        # Third choice: use current date/time
+        TIMESTAMP_DATE=$(date '+%Y-%m-%d')
+        TIMESTAMP_TIME=$(date '+%H:%M:%S')
+    fi
+fi
+
+# Format time for filename (example: pm 08,43,13)
+HOUR_24=$(echo "$TIMESTAMP_TIME" | cut -d: -f1)
+MINUTE=$(echo "$TIMESTAMP_TIME" | cut -d: -f2)
+SECOND=$(echo "$TIMESTAMP_TIME" | cut -d: -f3)
+
+if [[ "$HOUR_24" -lt 12 ]]; then
+    TIME_PERIOD="am"
+else
+    TIME_PERIOD="pm"
+fi
+
+HOUR_12=$((10#$HOUR_24 % 12))
+if [[ "$HOUR_12" -eq 0 ]]; then
+    HOUR_12=12
+fi
+
+TIME_FOR_TITLE="${TIME_PERIOD} $(printf '%02d' "$HOUR_12"),${MINUTE},${SECOND}"
+
+# Create safe filename from timestamp + title
+SAFE_TITLE=$(echo "$TITLE" | sed 's/[\/:]/ /g' | sed 's/  */ /g' | sed 's/^ *//' | sed 's/ *$//')
+BASE_TITLE="${TIMESTAMP_DATE} ${TIME_FOR_TITLE} - ${SAFE_TITLE}"
+
+NOTE_FILENAME="${BASE_TITLE}.md"
 NOTE_PATH="$VOICE_MEMOS_PATH/$NOTE_FILENAME"
+VTT_FILENAME="${BASE_TITLE}.vtt"
+VTT_PATH="$VOICE_MEMOS_PATH/$VTT_FILENAME"
 
 # Handle duplicate filenames
-if [[ -f "$NOTE_PATH" ]]; then
-    NOTE_FILENAME="${SAFE_TITLE} ${TODAY} ${TIME//:/-}.md"
-    NOTE_PATH="$VOICE_MEMOS_PATH/$NOTE_FILENAME"
+if [[ -f "$NOTE_PATH" || -f "$VTT_PATH" ]]; then
+    DUPLICATE_COUNT=2
+    while true; do
+        NOTE_FILENAME="${BASE_TITLE} ${DUPLICATE_COUNT}.md"
+        NOTE_PATH="$VOICE_MEMOS_PATH/$NOTE_FILENAME"
+        VTT_FILENAME="${BASE_TITLE} ${DUPLICATE_COUNT}.vtt"
+        VTT_PATH="$VOICE_MEMOS_PATH/$VTT_FILENAME"
+
+        if [[ ! -f "$NOTE_PATH" && ! -f "$VTT_PATH" ]]; then
+            break
+        fi
+
+        DUPLICATE_COUNT=$((DUPLICATE_COUNT + 1))
+    done
 fi
+
+# Save the VTT file
+log "Saving VTT: $VTT_PATH"
+cp "$TRANSCRIPTION_FILE" "$VTT_PATH"
 
 # Create the note file
 log "Creating note: $NOTE_PATH"
@@ -323,13 +403,5 @@ touch "$PROCESSED_MARKER"
 rm -rf "$TEMP_DIR"
 
 log "SUCCESS: Voice memo saved to $NOTE_PATH"
-
-# Optional: Delete the uploaded file from Gemini (cleanup)
-FILE_NAME=$(echo "$FILE_URI" | grep -o 'files/[^"]*')
-if [[ -n "$FILE_NAME" ]]; then
-    curl -s -X DELETE \
-        "${GEMINI_API_BASE}/v1beta/${FILE_NAME}?key=${GEMINI_API_KEY}" \
-        >/dev/null 2>&1 || true
-fi
 
 exit 0

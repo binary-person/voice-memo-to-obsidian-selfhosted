@@ -62,16 +62,64 @@ fi
 echo "  ✓ Vault found: $OBSIDIAN_VAULT"
 echo ""
 
-# Get Gemini API key
-echo "Enter your Gemini API key:"
-echo "(Get one at: https://makersuite.google.com/app/apikey)"
-read -r "GEMINI_API_KEY?> "
+# Get speaches.ai endpoint
+echo "Enter your speaches.ai endpoint:"
+echo "(e.g., http://192.168.1.123:8000)"
+read -r "SPEACHES_ENDPOINT?> "
 
-if [[ -z "$GEMINI_API_KEY" ]]; then
-    echo "ERROR: API key required"
+if [[ -z "$SPEACHES_ENDPOINT" ]]; then
+    echo "ERROR: SPEACHES_ENDPOINT required"
     exit 1
 fi
-echo "  ✓ API key received"
+echo "  ✓ Endpoint received"
+echo ""
+
+# Get speaches.ai model
+echo "Enter your speaches.ai model:"
+echo "(press Enter for default: Systran/faster-whisper-large-v3)"
+read -r "SPEACHES_MODEL?> "
+
+if [[ -z "$SPEACHES_MODEL" ]]; then
+    SPEACHES_MODEL="Systran/faster-whisper-large-v3"
+fi
+echo "  ✓ Model set: $SPEACHES_MODEL"
+echo ""
+
+# Get speaches.ai language
+echo "Enter your speaches.ai language:"
+echo "(press Enter for default: en)"
+echo "Note: for Systran/faster-whisper-large-v3, language codes follow Whisper's language mapping:"
+echo "https://github.com/openai/whisper/blob/main/whisper/tokenizer.py"
+echo "If unsure, confirm the model's expected language value before choosing one."
+read -r "SPEACHES_LANGUAGE?> "
+
+if [[ -z "$SPEACHES_LANGUAGE" ]]; then
+    SPEACHES_LANGUAGE="en"
+fi
+echo "  ✓ Language set: $SPEACHES_LANGUAGE"
+echo ""
+
+# Get Ollama endpoint
+echo "Enter your Ollama endpoint:"
+echo "(e.g., http://192.168.1.124:11434)"
+read -r "OLLAMA_ENDPOINT?> "
+
+if [[ -z "$OLLAMA_ENDPOINT" ]]; then
+    echo "ERROR: OLLAMA_ENDPOINT required"
+    exit 1
+fi
+echo "  ✓ Endpoint received"
+echo ""
+
+# Get Ollama model
+echo "Enter your Ollama model:"
+echo "(press Enter for default: gemma3:12b)"
+read -r "OLLAMA_MODEL?> "
+
+if [[ -z "$OLLAMA_MODEL" ]]; then
+    OLLAMA_MODEL="gemma3:12b"
+fi
+echo "  ✓ Model set: $OLLAMA_MODEL"
 echo ""
 
 # Create directories
@@ -91,11 +139,17 @@ echo "  ✓ Scripts installed"
 echo "Creating config..."
 cat > "$CONFIG_DIR/config" << EOF
 # Voice Memo to Obsidian Configuration
-GEMINI_API_KEY="$GEMINI_API_KEY"
+SPEACHES_ENDPOINT="$SPEACHES_ENDPOINT"
+SPEACHES_LANGUAGE="$SPEACHES_LANGUAGE"
+SPEACHES_MODEL="$SPEACHES_MODEL"
 OBSIDIAN_VAULT="$OBSIDIAN_VAULT"
+OLLAMA_ENDPOINT="$OLLAMA_ENDPOINT"
+OLLAMA_MODEL="$OLLAMA_MODEL"
 
-# Optional: change the Gemini model
-# GEMINI_MODEL="gemini-2.5-flash"
+# Optional defaults:
+# SPEACHES_LANGUAGE="en"
+# SPEACHES_MODEL="Systran/faster-whisper-large-v3"
+# OLLAMA_MODEL="gemma3:12b"
 EOF
 echo "  ✓ Config created"
 
