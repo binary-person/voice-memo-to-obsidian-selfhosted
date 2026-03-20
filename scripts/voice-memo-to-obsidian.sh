@@ -114,7 +114,19 @@ log "Processing: $FILENAME"
 TEMP_DIR=$(mktemp -d)
 PREPROCESSED_FILE="$TEMP_DIR/audio.m4a"
 TEMP_INPUT="$TEMP_DIR/input.${FILENAME##*.}"
+TRANSCRIPTION_FILE="$TEMP_DIR/transcription.vtt"
+TRANSCRIPTION_OVERRIDE_FILE="$PROMPTS_DIR/temp-transcription-override.vtt"
 
+# Check for temporary transcription override
+if [[ -f "$TRANSCRIPTION_OVERRIDE_FILE" && -n "$(tr -d '[:space:]' < "$TRANSCRIPTION_OVERRIDE_FILE")" ]]; then
+    log "Using transcription override: $TRANSCRIPTION_OVERRIDE_FILE"
+
+    if ! cp "$TRANSCRIPTION_OVERRIDE_FILE" "$TRANSCRIPTION_FILE" 2>&1; then
+        log "ERROR: Failed to copy transcription override"
+        rm -rf "$TEMP_DIR"
+        exit 1
+    fi
+else
 # Copy input file to temp (avoids FDA issues with ffmpeg)
 log "Copying to temp..."
 if ! cp "$INPUT_FILE" "$TEMP_INPUT" 2>&1; then
@@ -144,7 +156,6 @@ log "Audio file size: $FILE_SIZE bytes"
 
 # Step 1: Transcribe with speaches.ai
 log "Requesting transcription..."
-TRANSCRIPTION_FILE="$TEMP_DIR/transcription.vtt"
 
 # Read transcription prompt
 if [[ -f "$PROMPTS_DIR/transcription-prompt.md" ]]; then
@@ -179,6 +190,7 @@ if [[ ! -s "$TRANSCRIPTION_FILE" ]]; then
     log "ERROR: Transcription file is empty"
     rm -rf "$TEMP_DIR"
     exit 1
+    fi
 fi
 
 # Convert VTT to plain text for downstream analysis
@@ -246,6 +258,9 @@ curl -s -X POST \
 
 ANALYSIS_JSON=$("$JQ" -r '.response // empty' "$ANALYSIS_FILE" 2>/dev/null)
 
+rm -f "$CONFIG_DIR/last-analysis-response.json" "$CONFIG_DIR/last-analysis-response-raw.json"
+cp "$ANALYSIS_FILE" "$CONFIG_DIR/last-analysis-response-raw.json"
+
 if [[ -z "$ANALYSIS_JSON" ]]; then
     log "WARNING: Failed to get analysis, using defaults"
     log "Analysis response: $(cat "$ANALYSIS_FILE")"
@@ -254,10 +269,95 @@ if [[ -z "$ANALYSIS_JSON" ]]; then
     TAGS='["voicememos"]'
     TODOS='[]'
 else
+    echo "$ANALYSIS_JSON" > "$CONFIG_DIR/last-analysis-response.json"
     TITLE=$(echo "$ANALYSIS_JSON" | "$JQ" -r '.title // "Voice Memo"' 2>/dev/null || echo "Voice Memo")
     SUMMARY=$(echo "$ANALYSIS_JSON" | "$JQ" -r '.summary // "Voice memo"' 2>/dev/null || echo "Voice memo")
     TAGS=$(echo "$ANALYSIS_JSON" | "$JQ" -c '.tags // ["voicememos"]' 2>/dev/null || echo '["voicememos"]')
     TODOS=$(echo "$ANALYSIS_JSON" | "$JQ" -c '.todos // []' 2>/dev/null || echo '[]')
+fi
+
+# Step 3: Condense transcript
+log "Condensing transcript..."
+
+# Read condense prompt from Obsidian (or use default)
+if [[ -f "$PROMPTS_DIR/condense-prompt.md" ]]; then
+    CONDENSE_PROMPT_BASE=$(cat "$PROMPTS_DIR/condense-prompt.md")
+else
+    CONDENSE_PROMPT_BASE="Condense this voice memo transcript into a sparse hierarchical markdown outline.
+
+Output rules:
+- Return ONLY valid markdown. No preamble.  No explanation. No enclosing \`\`\`markdown fence.
+- Use exactly this structure:
+  - HH:MM:SS - major topic phrase
+    - HH:MM:SS - verb/subtopic phrase, verb/subtopic phrase
+- Create a new top-level bullet ONLY when there is a clear major topic shift.
+- Group nearby details under the same top-level bullet instead of creating a new heading for each timestamp.
+- Use sub-bullets for minor points, examples, clarifications, instructions, reactions, or follow-up comments within the same topic.
+- Keep top-level bullets rare.
+- Prefer 5–12 top-level bullets total unless the transcript truly changes topic more often.
+- Each bullet must be a fragment, not a full sentence.
+- Keep each line short and compressed.
+- Use concrete topic labels, not vague labels.
+
+Do not use:
+- \"discussion about\"
+- \"conversation about\"
+- \"they talked about\"
+- \"important note\"
+- \"feedback on\"
+- \"thoughts on\"
+- \"comments on\"
+- full grammatical sentences
+
+Compression rules:
+- Merge adjacent transcript segments that serve the same subject, task, decision, story beat, question, reaction, or activity.
+- Collapse repetitive wording, minor acknowledgements, filler, backchanneling, and small restatements unless they add new meaning.
+- Fold examples, clarifications, objections, replies, and follow-ups into the same parent topic unless they clearly start a new one.
+- Prefer fewer broader sections over many narrow ones.
+- Start a new top-level bullet only when the speaker focus clearly changes to a different subject, goal, or interaction.
+- Do not make a bullet for every timestamp.
+- Omit low-information lines that do not materially change the summary.
+
+Timestamp rules:
+- Use the timestamp where the topic begins.
+- Sub-bullets should use the timestamp where that sub-point begins.
+- Do not invent timestamps.
+
+Your first timestamp should be "00:00:00".
+
+Transcript:
+"
+fi
+CONDENSE_PROMPT="${CONDENSE_PROMPT_BASE}
+$(cat "$TRANSCRIPTION_FILE")"
+
+# Use jq to safely construct the JSON payload
+CONDENSE_PAYLOAD=$("$JQ" -n \
+    --arg model "$OLLAMA_MODEL" \
+    --arg prompt "$CONDENSE_PROMPT" \
+    '{
+        model: $model,
+        prompt: $prompt,
+        stream: false
+    }')
+
+CONDENSE_FILE="$TEMP_DIR/condense.json"
+curl -s -X POST \
+    "${OLLAMA_ENDPOINT}/api/generate" \
+    -H "Content-Type: application/json" \
+    -d "$CONDENSE_PAYLOAD" -o "$CONDENSE_FILE" 2>/dev/null
+
+CONDENSED_TRANSCRIPT=$("$JQ" -r '.response // empty' "$CONDENSE_FILE" 2>/dev/null)
+
+rm -f "$CONFIG_DIR/last-condense-response.txt" "$CONFIG_DIR/last-condense-response-raw.json"
+cp "$CONDENSE_FILE" "$CONFIG_DIR/last-condense-response-raw.json"
+
+if [[ -z "$CONDENSED_TRANSCRIPT" ]]; then
+    log "WARNING: Failed to condense transcript, using default"
+    log "Condense response: $(cat "$CONDENSE_FILE")"
+    CONDENSED_TRANSCRIPT="N/A"
+else
+    echo "$CONDENSED_TRANSCRIPT" > "$CONFIG_DIR/last-condense-response.txt"
 fi
 
 log "Analysis complete: $TITLE"
@@ -352,17 +452,21 @@ NOTE_FILENAME="${BASE_TITLE}.md"
 NOTE_PATH="$VOICE_MEMOS_PATH/$NOTE_FILENAME"
 VTT_FILENAME="${BASE_TITLE}.vtt"
 VTT_PATH="$VOICE_MEMOS_PATH/$VTT_FILENAME"
+AUDIO_FILENAME="${BASE_TITLE}.${FILENAME##*.}"
+AUDIO_PATH="$VOICE_MEMOS_PATH/$AUDIO_FILENAME"
 
 # Handle duplicate filenames
-if [[ -f "$NOTE_PATH" || -f "$VTT_PATH" ]]; then
+if [[ -f "$NOTE_PATH" || -f "$VTT_PATH" || -f "$AUDIO_PATH" ]]; then
     DUPLICATE_COUNT=2
     while true; do
         NOTE_FILENAME="${BASE_TITLE} ${DUPLICATE_COUNT}.md"
         NOTE_PATH="$VOICE_MEMOS_PATH/$NOTE_FILENAME"
         VTT_FILENAME="${BASE_TITLE} ${DUPLICATE_COUNT}.vtt"
         VTT_PATH="$VOICE_MEMOS_PATH/$VTT_FILENAME"
+        AUDIO_FILENAME="${BASE_TITLE} ${DUPLICATE_COUNT}.${FILENAME##*.}"
+        AUDIO_PATH="$VOICE_MEMOS_PATH/$AUDIO_FILENAME"
 
-        if [[ ! -f "$NOTE_PATH" && ! -f "$VTT_PATH" ]]; then
+        if [[ ! -f "$NOTE_PATH" && ! -f "$VTT_PATH" && ! -f "$AUDIO_PATH" ]]; then
             break
         fi
 
@@ -370,9 +474,25 @@ if [[ -f "$NOTE_PATH" || -f "$VTT_PATH" ]]; then
     done
 fi
 
+# Save the audio file
+log "Saving audio: $AUDIO_PATH"
+cp "$INPUT_FILE" "$AUDIO_PATH"
+
 # Save the VTT file
 log "Saving VTT: $VTT_PATH"
 cp "$TRANSCRIPTION_FILE" "$VTT_PATH"
+
+# Save audio title information
+AUDIO_TITLE=$(
+  ffprobe -v error \
+    -show_entries format_tags=title \
+    -of default=noprint_wrappers=1:nokey=1 \
+    "$INPUT_FILE"
+)
+log "Audio title is $AUDIO_TITLE"
+
+
+TRANSCRIPT_NO_NEWLINES=${TRANSCRIPT//$'\n'/}
 
 # Create the note file
 log "Creating note: $NOTE_PATH"
@@ -384,16 +504,24 @@ author:
   - "[[Me]]"
 created: "${TODAY}"
 time: "${TIME}"
+audio_title: "${AUDIO_TITLE}"
 status:
 ---
+
+![[${AUDIO_FILENAME}]]
+![[${VTT_FILENAME}]]
 
 ${TODOS_MD}## Summary
 
 $SUMMARY
 
+## Condensed transcript
+
+$CONDENSED_TRANSCRIPT
+
 ## Transcript
 
-$TRANSCRIPT
+$TRANSCRIPT_NO_NEWLINES
 MEMO
 
 # Mark as processed

@@ -172,6 +172,13 @@ else
     echo "  • Skipped: analysis-prompt.md (already exists)"
 fi
 
+if [[ ! -f "$PROMPTS_DIR/condense-prompt.md" ]]; then
+    cp "$SCRIPT_DIR/prompts/condense-prompt.sample.md" "$PROMPTS_DIR/condense-prompt.md"
+    echo "  ✓ Created: condense-prompt.md"
+else
+    echo "  • Skipped: condense-prompt.md (already exists)"
+fi
+
 # Create output directory in vault
 mkdir -p "$OBSIDIAN_VAULT/Daily/Babble"
 echo "  ✓ Output directory: Daily/Babble/"

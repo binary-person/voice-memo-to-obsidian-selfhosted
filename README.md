@@ -166,6 +166,7 @@ These files are created from samples on first install and never touched again:
 | `config` | `~/.config/voice-memo/` | `config.sample` |
 | `transcription-prompt.md` | `{vault}/Areas/Voice Memo Pipeline/` | `prompts/transcription-prompt.sample.md` |
 | `analysis-prompt.md` | `{vault}/Areas/Voice Memo Pipeline/` | `prompts/analysis-prompt.sample.md` |
+| `condense-prompt.md` | `{vault}/Areas/Voice Memo Pipeline/` | `prompts/condense-prompt.sample.md` |
 
 To reset a prompt to defaults, delete it and run `./install.sh` (it will skip existing files and only create missing ones).
 
@@ -236,6 +237,7 @@ Prompts are stored in your Obsidian vault at `Areas/Voice Memo Pipeline/`:
 |------|---------|
 | `transcription-prompt.md` | Instructions for transcription |
 | `analysis-prompt.md` | Instructions for title, summary, tags, and task extraction |
+| `condense-prompt.md` | Instructions for condensing transcription to something readable |
 
 Edit these directly in Obsidian to customize the AI behavior. Compare with the `.sample.md` files in this repo to see new features after upgrading.
 
